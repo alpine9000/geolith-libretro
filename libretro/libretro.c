@@ -29,6 +29,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -39,6 +40,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "geo_m68k.h"
 #include "geo_mixer.h"
 #include "geo_neo.h"
+#include "geo_profiler.h"
 
 #include "libretro.h"
 #include "libretro_core_options.h"
@@ -96,6 +98,14 @@ static retro_audio_sample_batch_t audio_batch_cb = NULL;
 static retro_environment_t environ_cb = NULL;
 static retro_input_poll_t input_poll_cb = NULL;
 static retro_input_state_t input_state_cb = NULL;
+
+static void prof_notify_cb(const char *msg, int frames) {
+    if (!environ_cb || !msg) return;
+    struct retro_message m = { msg, (unsigned)frames };
+    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &m);
+}
+
+// Profiler UI handled in geo_profiler.c
 
 // libretro input descriptors
 static struct retro_input_descriptor input_desc_js[] = { // Joysticks (Default)
@@ -983,6 +993,8 @@ void retro_set_video_refresh(retro_video_refresh_t cb) {
 
 void retro_reset(void) {
     geo_reset(0);
+    // Reset profiler stats on core reset (keep toggle state)
+    geo_profiler_reset();
 }
 
 void retro_run(void) {
@@ -992,6 +1004,24 @@ void retro_run(void) {
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &update) && update) {
         check_variables(false);
         geo_geom_refresh();
+    }
+
+    // Poll keyboard for profiler UI (toggle + scroll)
+    if (input_state_cb) {
+        void (*notify)(const char*, int) = environ_cb ? prof_notify_cb : NULL;
+        int k_f10 = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_F10) ? 1 : 0;
+        int k_comma = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_COMMA) ? 1 : 0;
+        int k_period = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_PERIOD) ? 1 : 0;
+        geo_profiler_ui_update(k_f10, k_comma, k_period, notify);
+    }
+
+    // Draw overlay via profiler helper
+    if (vbuf) {
+        int x_vis_left = video_crop_l;
+        int y_vis_top  = (video_crop_t + 16);
+        geo_profiler_draw_overlay(vbuf, LSPC_WIDTH, LSPC_HEIGHT,
+                                  x_vis_left, y_vis_top,
+                                  video_width_visible, video_height_visible);
     }
 
     video_cb(vbuf + (LSPC_WIDTH * (video_crop_t + 16)) + video_crop_l,
@@ -1067,6 +1097,9 @@ bool retro_load_game(const struct retro_game_info *info) {
         return false;
     }
 
+    // Initialize 68K profiler
+    geo_profiler_init();
+
     // Extract the game name from the path
     geo_retro_gamename(info->path);
 
@@ -1137,6 +1170,9 @@ void retro_unload_game(void) {
         else if (savestat != 2)
             log_cb(RETRO_LOG_DEBUG, "Save Failed: %s\n", savename);
     }
+
+    // Dump profiler results before freeing resources
+    geo_profiler_dump();
 
     if (romdata)
         free(romdata);

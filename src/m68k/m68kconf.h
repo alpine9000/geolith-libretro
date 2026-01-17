@@ -32,6 +32,9 @@
 #ifndef M68KCONF__HEADER
 #define M68KCONF__HEADER
 
+/* Forward declaration for instruction hook implemented in core */
+void geo_profiler_instr_hook(unsigned pc);
+
 
 /* Configuration switches.
  * Use OPT_SPECIFY_HANDLER for configuration options that allow callbacks.
@@ -160,10 +163,10 @@ int geo_m68k_int_ack(int level);
 
 
 /* If ON, CPU will call the instruction hook callback before every
- * instruction.
+ * instruction. Wire this to our profiler hook.
  */
-#define M68K_INSTRUCTION_HOOK       OPT_OFF
-#define M68K_INSTRUCTION_CALLBACK(pc) your_instruction_hook_function(pc)
+#define M68K_INSTRUCTION_HOOK       OPT_SPECIFY_HANDLER
+#define M68K_INSTRUCTION_CALLBACK(pc) geo_profiler_instr_hook(pc)
 
 
 /* If ON, the CPU will emulate the 4-byte prefetch queue of a real 68000 */

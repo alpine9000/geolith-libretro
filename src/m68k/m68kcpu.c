@@ -955,17 +955,18 @@ int m68k_execute(int num_cycles)
 	/* See if interrupts came in */
 	m68ki_check_interrupts();
 
-	/* Make sure we're not stopped */
-	if(!CPU_STOPPED)
-	{
+    /* Make sure we're not stopped */
+    if(!CPU_STOPPED)
+    {
 		/* Return point if we had an address error */
 		m68ki_set_address_error_trap(); /* auto-disable (see m68kcpu.h) */
 
 		m68ki_check_bus_error_trap();
 
-		/* Main loop.  Keep going until we run out of clock cycles */
-		do
-		{
+        /* Main loop.  Keep going until we run out of clock cycles */
+        int __geo_prev_cycrun = 0;
+        do
+        {
 			//int i;
 			/* Set tracing accodring to T1. (T0 is done inside instruction) */
 			m68ki_trace_t1(); /* auto-disable (see m68kcpu.h) */
@@ -987,12 +988,22 @@ int m68k_execute(int num_cycles)
 
 			/* Read an instruction and call its handler */
 			REG_IR = m68ki_read_imm_16();
-			m68ki_instruction_jump_table[REG_IR]();
-			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+            m68ki_instruction_jump_table[REG_IR]();
+            USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
 
-			/* Trace m68k_exception, if necessary */
-			m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */
-		} while(GET_CYCLES() > 0);
+            /* Trace m68k_exception, if necessary */
+            m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */
+
+            /* Geolith: report per-instruction cycle usage (prev PC, delta) */
+            {
+                extern void geo_profiler_account(unsigned pc, unsigned cycles);
+                int __geo_cycrun = m68ki_initial_cycles - GET_CYCLES();
+                int __geo_delta = __geo_cycrun - __geo_prev_cycrun;
+                if (__geo_delta > 0)
+                    geo_profiler_account(REG_PPC, (unsigned)__geo_delta);
+                __geo_prev_cycrun = __geo_cycrun;
+            }
+        } while(GET_CYCLES() > 0);
 
 		/* set previous PC to current PC for the next entry into the loop */
 		REG_PPC = REG_PC;
