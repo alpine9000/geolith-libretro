@@ -38,9 +38,18 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "geo.h"
 #include "geo_lspc.h"
 #include "geo_m68k.h"
+#include "m68k/m68k.h"
 #include "geo_mixer.h"
 #include "geo_neo.h"
 #include "geo_profiler.h"
+#include "geo_text.h"
+#include "geo_debugger.h"
+#include "geo_ui.h"
+#include "geo_ports.h"
+#include "geo_debugger.h"
+#include "geo_rsp.h"
+#include "geo_text.h"
+#include "geo_ipc.h"
 
 #include "libretro.h"
 #include "libretro_core_options.h"
@@ -98,6 +107,60 @@ static retro_audio_sample_batch_t audio_batch_cb = NULL;
 static retro_environment_t environ_cb = NULL;
 static retro_input_poll_t input_poll_cb = NULL;
 static retro_input_state_t input_state_cb = NULL;
+
+// Overlay base snapshot for correct blending while paused
+static uint32_t *overlay_base = NULL;
+static int overlay_bw = 0;
+static int overlay_bh = 0;
+static int overlay_base_ready = 0;
+
+// Present buffer (final composited visible frame)
+static uint32_t *present_buf = NULL;
+static int present_w = 0;
+static int present_h = 0;
+
+static void overlay_base_free(void) {
+    if (overlay_base) { free(overlay_base); overlay_base = NULL; overlay_bw = overlay_bh = 0; overlay_base_ready = 0; }
+}
+
+static void overlay_base_ensure(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (overlay_bw == w && overlay_bh == h && overlay_base) return;
+    overlay_base_free();
+    overlay_base = (uint32_t*)calloc((size_t)w * (size_t)h, sizeof(uint32_t));
+    if (overlay_base) { overlay_bw = w; overlay_bh = h; overlay_base_ready = 0; }
+}
+
+static void overlay_base_copy_from_vbuf(uint32_t *vbuf, int fbw, int x, int y, int w, int h) {
+    if (!overlay_base || !vbuf) return;
+    for (int row = 0; row < h; ++row) {
+        uint32_t *src = vbuf + (y + row) * fbw + x;
+        uint32_t *dst = overlay_base + row * overlay_bw;
+        memcpy(dst, src, (size_t)w * sizeof(uint32_t));
+    }
+    overlay_base_ready = 1;
+}
+
+static void overlay_base_copy_to_vbuf(uint32_t *vbuf, int fbw, int x, int y, int w, int h) {
+    if (!overlay_base || !vbuf) return;
+    for (int row = 0; row < h; ++row) {
+        uint32_t *dst = vbuf + (y + row) * fbw + x;
+        uint32_t *src = overlay_base + row * overlay_bw;
+        memcpy(dst, src, (size_t)w * sizeof(uint32_t));
+    }
+}
+
+static void present_free(void) {
+    if (present_buf) { free(present_buf); present_buf = NULL; present_w = present_h = 0; }
+}
+
+static void present_ensure(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (present_w == w && present_h == h && present_buf) return;
+    present_free();
+    present_buf = (uint32_t*)calloc((size_t)w * (size_t)h, sizeof(uint32_t));
+    if (present_buf) { present_w = w; present_h = h; }
+}
 
 static void prof_notify_cb(const char *msg, int frames) {
     if (!environ_cb || !msg) return;
@@ -916,6 +979,17 @@ void retro_init(void) {
 
     // Finish initialization
     geo_init();
+
+    // Start lightweight JSON IPC server for external UI process
+    if (geo_ipc_start() < 0) {
+        char msg[64]; snprintf(msg, sizeof(msg), "IPC bind failed on %d", GEO_IPC_PORT_DEFAULT);
+        prof_notify_cb(msg, 240);
+    }
+    // Start GDB RSP server (IDE/GDB connects to it)
+    if (geo_rsp_start() < 0) {
+        char msg[64]; snprintf(msg, sizeof(msg), "RSP bind failed on %d", GEO_RSP_PORT_DEFAULT);
+        prof_notify_cb(msg, 240);
+    }
 }
 
 void retro_deinit(void) {
@@ -926,6 +1000,11 @@ void retro_deinit(void) {
 
     free(abuf);
     abuf = NULL;
+
+    overlay_base_free();
+    present_free();
+    geo_ipc_stop();
+    geo_rsp_stop();
 }
 
 unsigned retro_api_version(void) {
@@ -938,8 +1017,8 @@ void retro_set_controller_port_device(unsigned port, unsigned device) {
 
 void retro_get_system_info(struct retro_system_info *info) {
     memset(info, 0, sizeof(*info));
-    info->library_name     = "Geolith";
-    info->library_version  = "0.3.0";
+    info->library_name     = "ENGINE9000 DEBUGGER/PROFILER";
+    info->library_version  = "";
     info->need_fullpath    = false;
     info->valid_extensions = "neo";
 }
@@ -966,9 +1045,35 @@ void retro_get_system_av_info(struct retro_system_av_info *info) {
     };
 }
 
+// Frontend keyboard tracking for reliable edges
+static int kb_t=0,kb_s=0,kb_n=0,kb_b=0,kb_bs=0,kb_f10=0,kb_quote=0;
+static int pkb_t=0,pkb_s=0,pkb_n=0,pkb_b=0,pkb_bs=0,pkb_f10=0,pkb_quote=0;
+// Profiler overlay visibility and saved state for mutual exclusion with debugger window
+static int prof_overlay_visible = 0;
+static int saved_dbg_vis_for_prof = -1;   // -1 = none saved, 0/1 saved state
+static int saved_prof_vis_for_dbg = -1;   // -1 = none saved, 0/1 saved state
+static void front_kb_cb(bool down, unsigned keycode, uint32_t character, uint16_t mod) {
+    (void)character; (void)mod;
+    switch (keycode) {
+        case RETROK_t:    kb_t   = down ? 1 : 0; break;
+        case RETROK_s:    kb_s   = down ? 1 : 0; break;
+        case RETROK_n:    kb_n   = down ? 1 : 0; break;
+        case RETROK_b:    kb_b   = down ? 1 : 0; break;
+        case RETROK_BACKSLASH: kb_bs = down ? 1 : 0; break;
+        case RETROK_F10:  kb_f10 = down ? 1 : 0; break;
+        case RETROK_QUOTE: kb_quote = down ? 1 : 0; break;
+        default: break;
+    }
+}
+
 void retro_set_environment(retro_environment_t cb) {
     environ_cb = cb;
     libretro_set_core_options(environ_cb);
+    // Register keyboard callback for reliable key events
+    struct retro_keyboard_callback kcb; memset(&kcb, 0, sizeof(kcb));
+    kcb.callback = front_kb_cb;
+    environ_cb(RETRO_ENVIRONMENT_SET_KEYBOARD_CALLBACK, &kcb);
+    // Servers start later in retro_init to avoid duplicate starts across env calls
 }
 
 void retro_set_audio_sample(retro_audio_sample_t cb) {
@@ -995,10 +1100,16 @@ void retro_reset(void) {
     geo_reset(0);
     // Reset profiler stats on core reset (keep toggle state)
     geo_profiler_reset();
+    // Keep debugger state; no explicit reset required
 }
 
 void retro_run(void) {
-    geo_exec();
+    // Early input so step/break applies before emulation
+    if (input_state_cb) {
+        void (*notify)(const char*, int) = environ_cb ? prof_notify_cb : NULL;
+        geo_ui_handle_input((geo_ui_input_state_t)input_state_cb, notify);
+    }
+    // (Order) Handle input first so step/break applies before emulation
 
     bool update = false;
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &update) && update) {
@@ -1006,28 +1117,69 @@ void retro_run(void) {
         geo_geom_refresh();
     }
 
-    // Poll keyboard for profiler UI (toggle + scroll)
-    if (input_state_cb) {
-        void (*notify)(const char*, int) = environ_cb ? prof_notify_cb : NULL;
-        int k_f10 = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_F10) ? 1 : 0;
-        int k_comma = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_COMMA) ? 1 : 0;
-        int k_period = input_state_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_PERIOD) ? 1 : 0;
-        geo_profiler_ui_update(k_f10, k_comma, k_period, notify);
+    // (input handled earlier this frame)
+
+    // Service RSP stop replies
+    {
+        uint32_t pc = (uint32_t)(m68k_get_reg(NULL, M68K_REG_PC)) & 0x00ffffffu;
+        uint32_t sr = (uint32_t)(m68k_get_reg(NULL, M68K_REG_SR)) & 0x0000ffffu;
+        geo_rsp_poll(pc, sr, geo_debugger_is_paused()?1:0);
     }
 
-    // Draw overlay via profiler helper
+    // Run emulation for this frame after processing input (so step/break takes effect now)
+    if (!geo_debugger_is_paused()) {
+        geo_exec();
+    }
+
+    // Compose base frame into present buffer and submit (no in-game overlays)
     if (vbuf) {
         int x_vis_left = video_crop_l;
         int y_vis_top  = (video_crop_t + 16);
-        geo_profiler_draw_overlay(vbuf, LSPC_WIDTH, LSPC_HEIGHT,
-                                  x_vis_left, y_vis_top,
-                                  video_width_visible, video_height_visible);
+        int vis_w = video_width_visible;
+        int vis_h = video_height_visible;
+
+        overlay_base_ensure(vis_w, vis_h);
+        present_ensure(vis_w, vis_h);
+
+        if (!geo_debugger_is_paused() || geo_debugger_consume_resnap_needed()) {
+            overlay_base_copy_from_vbuf(vbuf, LSPC_WIDTH, x_vis_left, y_vis_top, vis_w, vis_h);
+        }
+
+        if (present_buf) {
+            if (overlay_base_ready) {
+                for (int row = 0; row < vis_h; ++row)
+                    memcpy(present_buf + row * present_w, overlay_base + row * overlay_bw, (size_t)vis_w * sizeof(uint32_t));
+            } else {
+                for (int row = 0; row < vis_h; ++row) {
+                    const uint32_t *src = vbuf + (y_vis_top + row) * LSPC_WIDTH + x_vis_left;
+                    memcpy(present_buf + row * present_w, src, (size_t)vis_w * sizeof(uint32_t));
+                }
+            }
+            // Draw overlays via UI module
+            geo_ui_draw_overlays(present_buf, present_w, present_h, vis_w, vis_h);
+
+            // RSP overlay disabled unless we report errors on bind
+
+            // Remove PC/SR live box when debugger window not active (no overlays unless window visible)
+
+            // (profiler overlay drawn by UI module)
+
+            // No external windows; profiler renders in-emulator.
+        }
     }
 
-    video_cb(vbuf + (LSPC_WIDTH * (video_crop_t + 16)) + video_crop_l,
-        video_width_visible,
-        video_height_visible,
-        LSPC_WIDTH << 2);
+    // After finishing a frame, allow debugger to latch breakpoint notifications
+    if (environ_cb) {
+        void (*notify)(const char*, int) = prof_notify_cb;
+        geo_debugger_end_of_frame_update(notify);
+    }
+
+    if (present_buf) {
+        video_cb(present_buf,
+            video_width_visible,
+            video_height_visible,
+            video_width_visible << 2);
+    }
 
     audio_batch_cb(abuf, numsamps);
 }
@@ -1097,8 +1249,9 @@ bool retro_load_game(const struct retro_game_info *info) {
         return false;
     }
 
-    // Initialize 68K profiler
+    // Initialize 68K profiler and debugger
     geo_profiler_init();
+    geo_debugger_init();
 
     // Extract the game name from the path
     geo_retro_gamename(info->path);

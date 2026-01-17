@@ -166,7 +166,8 @@ int geo_m68k_int_ack(int level);
  * instruction. Wire this to our profiler hook.
  */
 #define M68K_INSTRUCTION_HOOK       OPT_SPECIFY_HANDLER
-#define M68K_INSTRUCTION_CALLBACK(pc) geo_profiler_instr_hook(pc)
+#include "../geo_hooks.h"
+#define M68K_INSTRUCTION_CALLBACK(pc) geo_instr_hook_dispatch(pc)
 
 
 /* If ON, the CPU will emulate the 4-byte prefetch queue of a real 68000 */

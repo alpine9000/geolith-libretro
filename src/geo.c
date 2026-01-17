@@ -604,8 +604,12 @@ void geo_watchdog_reset(void) {
     ngsys.watchdog = 0;
 }
 
+#include "geo_debugger.h"
 void geo_exec(void) {
+    int dbg_broke_midframe = 0;
     while (mcycs < MCYC_PER_FRAME) {
+        // Allow debugger to halt mid-frame after a single-instruction step or breakpoint
+        if (geo_debugger_break_now()) { dbg_broke_midframe = 1; break; }
         icycs = geo_m68k_run(1);
         mcycs += (icycs * DIV_M68K) >> oc;
 
@@ -652,6 +656,11 @@ void geo_exec(void) {
 
     mcycs %= MCYC_PER_FRAME;
     zcycs %= MCYC_PER_FRAME;
+
+    if (dbg_broke_midframe) {
+        // Skip audio and watchdog when breaking mid-frame to avoid unintended resets
+        return;
+    }
 
     // Pass audio generated this frame to the frontend for output
     geo_mixer_output(ymsamps);

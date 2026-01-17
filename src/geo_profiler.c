@@ -1,7 +1,6 @@
 /*
- Simple 68K profiler: samples PC every N instructions,
- accumulates hit counts, dumps to a text file on unload.
- Symbol resolution from ELF will be added incrementally.
+ Simple 68K profiler: samples PC every N instructions and aggregates per source line.
+ Outputs JSON on demand and a live on-screen overlay.
 */
 
 #include <stdio.h>
@@ -22,8 +21,6 @@ static const char *k_prof_json_path;
 static uint32_t g_sampling_mask = 0u; // 0 => every instruction
 
 // Profiler version (internal)
-// Removed from text output; retained here for potential future use
-// #define GEO_PROF_VERSION 9
 
 // Forward declarations and types for line table aggregation
 typedef struct LAgg { char *key; uint64_t cycles; } LAgg;
@@ -137,7 +134,7 @@ static const char *get_source_cached(uint32_t file_idx, uint32_t line) {
         if (e->key == 0 || e->key == key) { if (e->text) free(e->text); e->key = key; e->text = txt; return txt; }
         idx = (idx + 1u) & (SRC_CACHE_SZ - 1u);
     }
-    // Table full: drop caching; just return the text pointer (leaked). To avoid leak, free and return NULL.
+    // Table full: drop caching politely
     if (txt) free(txt);
     return NULL;
 }
@@ -166,10 +163,7 @@ static int cmp_profline_tmp_desc(const void *a, const void *b) {
     return 0;
 }
 
-// Build line table once for live updates
-// ELF helpers moved to geo_profiler_elf.c
-
-// Text output controls removed; profiler uses JSON only.
+// Build line table once for live updates (ELF helpers in geo_profiler_elf.c)
 
 // Paths are provided via environment variables at init; no defaults
 static const char *k_prof_elf_path = NULL;
@@ -201,6 +195,7 @@ static ProfEntry *g_table = NULL;
 static uint32_t g_used = 0;
 static uint32_t g_sample_accum = 0;
 static int g_enabled = 0;
+static int g_ever_enabled = 0; // tracks if profiler was ever enabled during this session
 
 static inline uint32_t prof_hash(uint32_t addr) {
     // mix 24-bit addr
@@ -309,6 +304,7 @@ void geo_profiler_account(unsigned pc, unsigned cycles) {
 
 void geo_profiler_set_enabled(int enabled) {
     g_enabled = enabled ? 1 : 0;
+    if (g_enabled) g_ever_enabled = 1;
 }
 
 int geo_profiler_get_enabled(void) {
@@ -1175,6 +1171,9 @@ static int elf_endian_be(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return 0; unsigned char hdr[6] = {0}; size_t r=fread(hdr,1,6,f); fclose(f); if (r<6) return 0; return hdr[5] == 2; }
 
 void geo_profiler_dump(void) {
+    // If profiler was never enabled, do not emit any output
+    if (!g_ever_enabled)
+        return;
     if (!g_table)
         return;
 
@@ -1196,9 +1195,7 @@ void geo_profiler_dump(void) {
     // Sort by samples descending for PC list (stable/simple sort)
     qsort(pairs, npairs, sizeof(OutPair), cmp_desc_count);
 
-    // Function and inline aggregation removed (minimal trim)
-
-    // Text output removed; JSON is emitted below
+    // Function-level aggregation removed (line-level aggregation + JSON only)
 
     // By-line aggregation (DWARF .debug_line)
     build_global_line_table();
@@ -1232,7 +1229,6 @@ void geo_profiler_dump(void) {
         }
         // Sort desc
         qsort(lags, nlag, sizeof(LAgg), cmp_lagg_desc);
-        // Text sections disabled by default; legacy code removed
 
         for (size_t i=0;i<nlag;++i) free(lags[i].key);
         free(lags);

@@ -1393,6 +1393,17 @@ void geo_m68k_board_set(unsigned btype) {
     }
 }
 
+// Musashi disassembler memory accessors
+unsigned m68k_read_disassembler_8(unsigned address) {
+    return m68k_read_memory_8(address);
+}
+unsigned m68k_read_disassembler_16(unsigned address) {
+    return m68k_read_memory_16(address);
+}
+unsigned m68k_read_disassembler_32(unsigned address) {
+    return m68k_read_memory_32(address);
+}
+
 void geo_m68k_postload(void) {
     // Byteswap the BIOS and P ROM
     swapb16_range(romdata->b, romdata->bsz);
