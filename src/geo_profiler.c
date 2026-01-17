@@ -17,8 +17,9 @@ static const char *k_prof_elf_path;
 static const char *k_prof_out_path;
 static const char *k_prof_json_path;
 
-// Sample 1 out of 16 instructions by default
+// Default: sample every instruction; can downsample via env in init
 #define GEO_PROF_SAMPLING_SHIFT 4
+static uint32_t g_sampling_mask = 0u; // 0 => every instruction
 
 // Profiler version (internal)
 // Removed from text output; retained here for potential future use
@@ -220,6 +221,20 @@ void geo_profiler_init(void) {
     if (e_txt && e_txt[0]) k_prof_out_path = e_txt;
     const char *e_json = getenv("GEO_PROF_JSON");
     if (e_json && e_json[0]) k_prof_json_path = e_json;
+    // Sampling controls: GEO_PROF_SAMPLE_EVERY=1 forces per-instruction sampling.
+    // Or override shift via GEO_PROF_SAMPLING_SHIFT=0..n (0 means every instruction).
+    {
+        const char *e_every = getenv("GEO_PROF_SAMPLE_EVERY");
+        const char *e_shift = getenv("GEO_PROF_SAMPLING_SHIFT");
+        if (e_every && e_every[0] && e_every[0] != '0') {
+            g_sampling_mask = 0u;
+        } else if (e_shift && e_shift[0]) {
+            int sh = atoi(e_shift);
+            if (sh <= 0) g_sampling_mask = 0u;
+            else if (sh >= 16) g_sampling_mask = 0xffffffffu; // guard against overflow
+            else g_sampling_mask = (uint32_t)((1u << sh) - 1u);
+        }
+    }
     g_table = (ProfEntry*)calloc(PROF_TABLE_SIZE, sizeof(ProfEntry));
     g_used = 0;
     g_sample_accum = 0;
@@ -233,8 +248,8 @@ void geo_profiler_instr_hook(unsigned pc) {
     if (!g_enabled)
         return;
 
-    // Sample every 2^GEO_PROF_SAMPLING_SHIFT instructions
-    if ((g_sample_accum++ & ((1u << GEO_PROF_SAMPLING_SHIFT) - 1u)) != 0)
+    // Sample every (mask+1) instructions; mask=0 means every instruction
+    if ((g_sample_accum++ & g_sampling_mask) != 0)
         return;
 
     // 68000 uses 24-bit address space

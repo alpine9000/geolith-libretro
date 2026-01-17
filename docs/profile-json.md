@@ -29,6 +29,15 @@ Schema
 - Object fields (optional; may be added by post‑processing):
   - function_chain: string
     - A demangled inline chain in the form "callee -> ... -> caller" (top → bottom), when available from an external resolver (e.g., addr2line/llvm-symbolizer).
+  - function_chain_frames: array of objects
+    - Structured representation of the inline chain; ordered top → bottom to match function_chain.
+    - Each frame object contains:
+      - function: string (demangled name)
+      - file: string (path as returned by the symbolizer)
+      - line: integer
+      - loc: string in the form "filename.c:<line>" (basename + line) for easy display and filtering.
+  - loc: string
+    - Optional convenience alias of the top-level file/line for quick filtering; format "filename.c:<line>".
   - Additional fields are permitted. Resolvers may add fields but should not remove required fields.
 
 Semantics and notes
@@ -46,6 +55,10 @@ Environment
 - The core requires environment variables to be set before enabling the profiler:
   - GEO_PROF_ELF: absolute path to an ELF binary with DWARF debug info for .debug_line mapping.
   - GEO_PROF_JSON: absolute path where the JSON file will be written.
+  - Sampling controls (default: every instruction):
+    - By default, the profiler samples every instruction for best fidelity.
+    - To downsample, set GEO_PROF_SAMPLING_SHIFT=N to sample every 2^N instructions (e.g., N=4 → 1/16).
+    - GEO_PROF_SAMPLE_EVERY=1 explicitly forces per-instruction sampling (normally not needed).
 - The resolver script can enrich the JSON and also supports:
   - GEO_PROF_SRC_BASE (optional): source tree root for reading source lines by basename if the ‘source’ field is missing.
 
@@ -58,7 +71,12 @@ Example
     "count": 4567,
     "address": "0x02A3F0",
     "source": "update_player(&state);",
-    "function_chain": "update_player -> main_loop"
+    "function_chain": "update_player -> main_loop",
+    "function_chain_frames": [
+      { "function": "update_player", "file": "/src/game.c", "line": 123, "loc": "game.c:123" },
+      { "function": "main_loop",     "file": "/src/main.c", "line": 412, "loc": "main.c:412" }
+    ],
+    "loc": "game.c:123"
   },
   {
     "file": "sprite.c",
@@ -74,4 +92,3 @@ Consumer guidance
 - Treat ‘cycles’ as the primary ranking metric for hotspots; ‘count’ is useful for sanity‑checking coverage given the sampling rate.
 - Do not depend on array order; explicitly sort by cycles or count.
 - ‘source’ is a convenience field and may be empty when the source file cannot be located; use GEO_PROF_SRC_BASE with the resolver to improve coverage.
-

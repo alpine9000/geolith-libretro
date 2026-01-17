@@ -84,36 +84,66 @@ def symbolize(elf, addr):
         return chain.split(' ; ')[0]
     return '??'
 
-def symbolize_chain(elf, addr):
+def _parse_frames_from_lines(lines):
+    # lines alternates: func, file:line, func, file:line, ...
+    frames = []
+    for i in range(0, len(lines) - 1, 2):
+        func = lines[i].strip()
+        fl = lines[i + 1].strip()
+        file_path = fl
+        line_no = 0
+        if ':' in fl:
+            file_path, ln = fl.rsplit(':', 1)
+            try:
+                line_no = int(ln)
+            except ValueError:
+                line_no = 0
+        base = os.path.basename(file_path)
+        frames.append({
+            'function': func or '??',
+            'file': file_path,
+            'line': line_no,
+            'loc': f"{base}:{line_no}" if base else f":{line_no}"
+        })
+    return frames
+
+def symbolize_chain_frames(elf, addr):
     # Prefer cross addr2line for m68k (-i prints inline chain as pairs: func, file:line)
     try:
         out = subprocess.check_output(['m68k-neogeo-elf-addr2line', '-e', elf, '-f', '-C', '-i', addr], stderr=subprocess.STDOUT, universal_newlines=True)
         lines = [l.strip() for l in out.splitlines() if l.strip()]
-        # function names are on even indices (0,2,4,...) with file:line following
-        funcs = [lines[i] for i in range(0, len(lines), 2)] if lines else []
-        if funcs:
-            # Reverse to get top -> bottom and join with " -> "
-            return ' -> '.join(funcs[::-1])
+        if lines:
+            frames = _parse_frames_from_lines(lines)
+            if frames:
+                return frames[::-1]  # top -> bottom
     except Exception:
         pass
     # Try llvm-symbolizer (prints func then file:line per frame)
     try:
         out = subprocess.check_output(['llvm-symbolizer', '--inlines', '-e', elf, addr], stderr=subprocess.STDOUT, universal_newlines=True)
         lines = [l.strip() for l in out.splitlines() if l.strip()]
-        funcs = [lines[i] for i in range(0, len(lines), 2)] if lines else []
-        if funcs:
-            return ' -> '.join(funcs[::-1])
+        if lines:
+            frames = _parse_frames_from_lines(lines)
+            if frames:
+                return frames[::-1]
     except Exception:
         pass
     # Fallback to llvm-addr2line
     try:
         out = subprocess.check_output(['llvm-addr2line', '-e', elf, '-f', '-C', '-i', addr], stderr=subprocess.STDOUT, universal_newlines=True)
         lines = [l.strip() for l in out.splitlines() if l.strip()]
-        funcs = [lines[i] for i in range(0, len(lines), 2)] if lines else []
-        if funcs:
-            return ' -> '.join(funcs[::-1])
+        if lines:
+            frames = _parse_frames_from_lines(lines)
+            if frames:
+                return frames[::-1]
     except Exception:
         pass
+    return []
+
+def symbolize_chain(elf, addr):
+    frames = symbolize_chain_frames(elf, addr)
+    if frames:
+        return ' -> '.join([f['function'] for f in frames])
     return ''
 
 def main():
@@ -150,6 +180,10 @@ def main():
             addr = obj.get('address')
             if addr:
                 out['function_chain'] = symbolize_chain(ELF_PATH, addr)
+                frames = symbolize_chain_frames(ELF_PATH, addr)
+                if frames:
+                    # Backward-compatible structured data alongside formatted string
+                    out['function_chain_frames'] = frames
             # Ensure source is present
             if not out.get('source') and SRC_BASE:
                 fn = out.get('file'); lno = out.get('line') or 0
@@ -207,7 +241,8 @@ def main():
             base_inl = ''
         else:
             file_line, cycles, addr, count, base_fun, base_inl = ent
-        chain = symbolize_chain(ELF_PATH, addr)
+        frames = symbolize_chain_frames(ELF_PATH, addr)
+        chain = ' -> '.join([f['function'] for f in frames]) if frames else ''
         # Read source text
         src_txt = ''
         fpath = file_line
@@ -238,6 +273,8 @@ def main():
             'function_chain': chain,
             'source': src_txt
         }
+        if frames:
+            obj['function_chain_frames'] = frames
         if count != '':
             try:
                 obj['count'] = int(count)
