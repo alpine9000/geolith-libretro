@@ -32,6 +32,8 @@ int  geo_debugger_consume_resnap_needed(void);
 // Called from retro layer at end of a frame to latch breakpoint hits
 void geo_debugger_end_of_frame_update(void (*notify)(const char *msg, int frames));
 
+void geo_debugger_list_breakpoints(void (*notify)(const char *msg, int frames));
+
 // UI and overlay (always enabled; window visibility controls display)
 void geo_debugger_ui_update(int key_enable, int key_toggle, int key_continue,
                             int key_step_instr, int key_step_line,

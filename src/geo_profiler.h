@@ -12,7 +12,8 @@ void geo_profiler_init(void);
 void geo_profiler_instr_hook(unsigned pc);
 
 // Dump results to hard-coded path and reset state
-void geo_profiler_dump(void);
+int  geo_profiler_dump(void);
+const char *geo_profiler_dump_path(void);
 
 // Enable/disable sampling at runtime
 void geo_profiler_set_enabled(int enabled);
@@ -30,8 +31,20 @@ typedef struct geo_prof_line_hit_s {
     const char *source; // optional cached source text for this line (may be NULL)
 } geo_prof_line_hit_t;
 
+typedef struct geo_profiler_stream_hit_s {
+    uint32_t pc;
+    uint64_t samples;
+    uint64_t cycles;
+} geo_profiler_stream_hit_t;
+
 // Fill up to max entries with current top lines by cycles; returns count filled
 size_t geo_profiler_top_lines(geo_prof_line_hit_t *out, size_t max);
+
+// Streaming helpers (collect hits since last flush, enable/disable stream tracking)
+void geo_profiler_stream_enable(int enable);
+size_t geo_profiler_stream_collect(geo_profiler_stream_hit_t *out, size_t max);
+size_t geo_profiler_stream_pending(void);
+void geo_profiler_capture_stream_hits(const geo_profiler_stream_hit_t *hits, size_t count);
 
 // Optional: handle UI keys and notifications (F10 toggle, scrolling)
 // - key_* are 1 if currently pressed, 0 otherwise (edge detection handled internally)

@@ -53,8 +53,9 @@ Semantics and notes
 
 Environment
 - The core requires environment variables to be set before enabling the profiler:
-  - GEO_PROF_ELF: absolute path to an ELF binary with DWARF debug info for .debug_line mapping.
-  - GEO_PROF_JSON: absolute path where the JSON file will be written.
+- GEO_PROF_ELF: absolute path to an ELF binary with DWARF debug info for .debug_line mapping.
+- GEO_PROF_JSON: absolute path where the JSON file will be written.
+- GEO_PROF_TXT: legacy alias for GEO_PROF_JSON; still accepted when only a text path was configured previously.
   - Sampling controls (default: every instruction):
     - By default, the profiler samples every instruction for best fidelity.
     - To downsample, set GEO_PROF_SAMPLING_SHIFT=N to sample every 2^N instructions (e.g., N=4 → 1/16).

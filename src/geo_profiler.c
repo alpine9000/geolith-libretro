@@ -4,9 +4,14 @@
 */
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+
+#include "geo_notify.h"
+#include <errno.h>
 
 #include "geo_profiler.h"
 #include "geo_profiler_elf.h"
@@ -17,7 +22,7 @@ static const char *k_prof_out_path;
 static const char *k_prof_json_path;
 
 // Default: sample every instruction; can downsample via env in init
-#define GEO_PROF_SAMPLING_SHIFT 4
+#define GEO_PROF_SAMPLING_SHIFT 0
 static uint32_t g_sampling_mask = 0u; // 0 => every instruction
 
 // Profiler version (internal)
@@ -197,6 +202,37 @@ static uint32_t g_sample_accum = 0;
 static int g_enabled = 0;
 static int g_ever_enabled = 0; // tracks if profiler was ever enabled during this session
 
+// Stream verification state (only present when VERIFICATION enabled)
+#ifdef GEO_PROF_STREAM_VERIFY
+static ProfEntry *g_stream_capture = NULL;
+static ProfEntry *g_stream_capture_prev = NULL;
+static uint32_t g_stream_capture_used = 0;
+#endif
+
+static uint32_t *g_entry_epochs = NULL;
+static uint32_t *g_stream_delta_idxs = NULL;
+static size_t g_stream_delta_count = 0;
+static uint32_t g_stream_epoch = 1;
+static int g_stream_enabled = 0;
+
+static void stream_epoch_advance(void) {
+    g_stream_delta_count = 0;
+    g_stream_epoch++;
+    if (g_stream_epoch == 0) {
+        if (g_entry_epochs) memset(g_entry_epochs, 0, PROF_TABLE_SIZE * sizeof(uint32_t));
+        g_stream_epoch = 1;
+    }
+}
+
+static void stream_mark_idx(uint32_t idx) {
+    if (!g_stream_enabled || !g_stream_delta_idxs || !g_entry_epochs || idx >= PROF_TABLE_SIZE) return;
+    if (g_entry_epochs[idx] == g_stream_epoch) return;
+    g_entry_epochs[idx] = g_stream_epoch;
+    if (g_stream_delta_count < PROF_TABLE_SIZE) {
+        g_stream_delta_idxs[g_stream_delta_count++] = idx;
+    }
+}
+
 static inline uint32_t prof_hash(uint32_t addr) {
     // mix 24-bit addr
     uint32_t x = addr;
@@ -205,6 +241,77 @@ static inline uint32_t prof_hash(uint32_t addr) {
     x ^= x >> 16;
     return x & PROF_TABLE_MASK;
 }
+
+#ifdef GEO_PROF_STREAM_VERIFY
+static ProfEntry *stream_capture_lookup(ProfEntry *table, uint32_t addr, int create, uint32_t *used) {
+    if (!table) return NULL;
+    uint32_t idx = prof_hash(addr);
+    for (uint32_t nprobe = 0; nprobe < PROF_TABLE_SIZE; ++nprobe) {
+        ProfEntry *e = &table[idx];
+        if (e->key == addr + 1u) {
+            return e;
+        }
+        if (create && e->key == 0) {
+            e->key = addr + 1u;
+            e->samples = 0;
+            e->cycles = 0;
+            if (used) ++*used;
+            return e;
+        }
+        idx = (idx + 1u) & PROF_TABLE_MASK;
+    }
+    return NULL;
+}
+
+static void stream_capture_reset(void) {
+    if (g_stream_capture) memset(g_stream_capture, 0, PROF_TABLE_SIZE * sizeof(ProfEntry));
+    if (g_stream_capture_prev) memset(g_stream_capture_prev, 0, PROF_TABLE_SIZE * sizeof(ProfEntry));
+    g_stream_capture_used = 0;
+}
+
+static void stream_capture_free(void) {
+    free(g_stream_capture);
+    g_stream_capture = NULL;
+    free(g_stream_capture_prev);
+    g_stream_capture_prev = NULL;
+    g_stream_capture_used = 0;
+}
+
+static void stream_capture_record_hits(const geo_profiler_stream_hit_t *hits, size_t count) {
+    if (!hits || count == 0) return;
+    if (!g_stream_capture || !g_stream_capture_prev) return;
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t addr = hits[i].pc & 0x00ffffffu;
+        uint64_t new_samples = hits[i].samples;
+        uint64_t new_cycles = hits[i].cycles;
+        ProfEntry *prev = stream_capture_lookup(g_stream_capture_prev, addr, 1, NULL);
+        uint64_t last_samples = prev ? prev->samples : 0;
+        uint64_t last_cycles = prev ? prev->cycles : 0;
+        uint64_t delta_samples = (new_samples >= last_samples) ? new_samples - last_samples : new_samples;
+        uint64_t delta_cycles = (new_cycles >= last_cycles) ? new_cycles - last_cycles : new_cycles;
+        ProfEntry *agg = stream_capture_lookup(g_stream_capture, addr, 1, &g_stream_capture_used);
+        if (agg) {
+            agg->samples += delta_samples;
+            agg->cycles += delta_cycles;
+        }
+        if (prev) {
+            prev->samples = new_samples;
+            prev->cycles = new_cycles;
+        }
+    }
+}
+
+void geo_profiler_capture_stream_hits(const geo_profiler_stream_hit_t *hits, size_t count) {
+    stream_capture_record_hits(hits, count);
+}
+#else
+static void stream_capture_reset(void) {}
+static void stream_capture_free(void) {}
+void geo_profiler_capture_stream_hits(const geo_profiler_stream_hit_t *hits, size_t count) {
+    (void)hits;
+    (void)count;
+}
+#endif
 
 void geo_profiler_init(void) {
     if (g_table)
@@ -234,6 +341,16 @@ void geo_profiler_init(void) {
     g_used = 0;
     g_sample_accum = 0;
     g_enabled = 0; // start disabled; enable via toggle
+#ifdef GEO_PROF_STREAM_VERIFY
+    g_stream_capture = (ProfEntry*)calloc(PROF_TABLE_SIZE, sizeof(ProfEntry));
+    g_stream_capture_prev = (ProfEntry*)calloc(PROF_TABLE_SIZE, sizeof(ProfEntry));
+    g_stream_capture_used = 0;
+#endif
+    g_entry_epochs = (uint32_t*)calloc(PROF_TABLE_SIZE, sizeof(uint32_t));
+    g_stream_delta_idxs = (uint32_t*)malloc(PROF_TABLE_SIZE * sizeof(uint32_t));
+    g_stream_delta_count = 0;
+    g_stream_epoch = 1;
+    g_stream_enabled = 0;
     // Build line table now for live overlay aggregation
     build_global_line_table();
     memset(g_src_cache, 0, sizeof(g_src_cache));
@@ -251,22 +368,24 @@ void geo_profiler_instr_hook(unsigned pc) {
     uint32_t a = pc & 0x00ffffffu;
 
     uint32_t idx = prof_hash(a);
-    for (uint32_t nprobe = 0; nprobe < PROF_TABLE_SIZE; ++nprobe) {
-        ProfEntry *e = &g_table[idx];
-        if (e->key == 0) {
-            // insert
-            e->key = a + 1u; // avoid zero reserved value
-            e->samples = 1u;
-            e->cycles = 0u;
-            ++g_used;
-            return;
+        for (uint32_t nprobe = 0; nprobe < PROF_TABLE_SIZE; ++nprobe) {
+            ProfEntry *e = &g_table[idx];
+            if (e->key == 0) {
+                // insert
+                e->key = a + 1u; // avoid zero reserved value
+                e->samples = 1u;
+                e->cycles = 0u;
+                ++g_used;
+                stream_mark_idx(idx);
+                return;
+            }
+            if ((e->key - 1u) == a) {
+                ++e->samples;
+                stream_mark_idx(idx);
+                return;
+            }
+            idx = (idx + 1u) & PROF_TABLE_MASK;
         }
-        if ((e->key - 1u) == a) {
-            ++e->samples;
-            return;
-        }
-        idx = (idx + 1u) & PROF_TABLE_MASK;
-    }
     // Table full; drop sample silently
 }
 
@@ -280,21 +399,23 @@ void geo_profiler_account(unsigned pc, unsigned cycles) {
 
     uint32_t a = pc & 0x00ffffffu;
     uint32_t idx = prof_hash(a);
-    for (uint32_t nprobe = 0; nprobe < PROF_TABLE_SIZE; ++nprobe) {
-        ProfEntry *e = &g_table[idx];
-        if (e->key == 0) {
-            e->key = a + 1u;
-            e->samples = 0u;
-            e->cycles = (uint64_t)cycles;
-            ++g_used;
-            return;
+        for (uint32_t nprobe = 0; nprobe < PROF_TABLE_SIZE; ++nprobe) {
+            ProfEntry *e = &g_table[idx];
+            if (e->key == 0) {
+                e->key = a + 1u;
+                e->samples = 0u;
+                e->cycles = (uint64_t)cycles;
+                ++g_used;
+                stream_mark_idx(idx);
+                return;
+            }
+            if ((e->key - 1u) == a) {
+                e->cycles += (uint64_t)cycles;
+                stream_mark_idx(idx);
+                return;
+            }
+            idx = (idx + 1u) & PROF_TABLE_MASK;
         }
-        if ((e->key - 1u) == a) {
-            e->cycles += (uint64_t)cycles;
-            return;
-        }
-        idx = (idx + 1u) & PROF_TABLE_MASK;
-    }
     // Live line aggregation by cycles
     if (g_line_rows && g_line_nrows) {
         const LineRow *r = geo_line_find_row_addr(g_line_rows, g_line_nrows, a);
@@ -321,6 +442,11 @@ void geo_profiler_reset(void) {
     memset(g_line_agg, 0, sizeof(g_line_agg));
     src_cache_clear();
     geo_profiler_render_reset();
+    if (g_entry_epochs) memset(g_entry_epochs, 0, PROF_TABLE_SIZE * sizeof(uint32_t));
+    g_stream_delta_count = 0;
+    g_stream_epoch = 1;
+    g_stream_enabled = 0;
+    stream_capture_reset();
 }
 
 size_t geo_profiler_top_lines(geo_prof_line_hit_t *out, size_t max) {
@@ -361,6 +487,37 @@ size_t geo_profiler_top_lines(geo_prof_line_hit_t *out, size_t max) {
     }
     free(tmp);
     return filled;
+}
+
+void geo_profiler_stream_enable(int enable) {
+    g_stream_enabled = enable ? 1 : 0;
+    if (!g_stream_enabled) {
+        stream_epoch_advance();
+    }
+}
+
+size_t geo_profiler_stream_collect(geo_profiler_stream_hit_t *out, size_t max) {
+    if (!g_table || !g_stream_delta_idxs) {
+        stream_epoch_advance();
+        return 0;
+    }
+    size_t avail = g_stream_delta_count;
+    size_t take = max == 0 ? avail : (max < avail ? max : avail);
+    if (out && take > 0) {
+        for (size_t i = 0; i < take; ++i) {
+            uint32_t idx = g_stream_delta_idxs[i];
+            const ProfEntry *e = &g_table[idx];
+            out[i].pc = e->key ? (e->key - 1u) : 0u;
+            out[i].samples = e->samples;
+            out[i].cycles = e->cycles;
+        }
+    }
+    stream_epoch_advance();
+    return take;
+}
+
+size_t geo_profiler_stream_pending(void) {
+    return g_stream_delta_count;
 }
 
 // -------------------- UI handling --------------------
@@ -1170,163 +1327,231 @@ static FuncSym *load_func_symbols_dwarf(const char *path, size_t *out_count) {
 static int elf_endian_be(const char *path) {
     FILE *f = fopen(path, "rb"); if (!f) return 0; unsigned char hdr[6] = {0}; size_t r=fread(hdr,1,6,f); fclose(f); if (r<6) return 0; return hdr[5] == 2; }
 
-void geo_profiler_dump(void) {
-    // If profiler was never enabled, do not emit any output
-    if (!g_ever_enabled)
-        return;
-    if (!g_table)
-        return;
+static OutPair *collect_pairs_from_table(const ProfEntry *table, uint32_t used_estimate, size_t *out_count) {
+    if (!table || !out_count) return NULL;
+    size_t cap = used_estimate ? used_estimate : 1;
+    OutPair *pairs = (OutPair*)malloc(cap * sizeof(OutPair));
+    if (!pairs) return NULL;
+    size_t count = 0;
+    for (size_t i = 0; i < PROF_TABLE_SIZE; ++i) {
+        if (table[i].key != 0 && (table[i].samples || table[i].cycles)) {
+            if (count >= cap) {
+                size_t nc = cap ? cap * 2 : 1;
+                OutPair *tmp = (OutPair*)realloc(pairs, nc * sizeof(OutPair));
+                if (!tmp) {
+                    free(pairs);
+                    return NULL;
+                }
+                pairs = tmp;
+                cap = nc;
+            }
+            pairs[count].addr = table[i].key - 1u;
+            pairs[count].samples = table[i].samples;
+            pairs[count].cycles = table[i].cycles;
+            ++count;
+        }
+    }
+    qsort(pairs, count, sizeof(OutPair), cmp_desc_count);
+    *out_count = count;
+    return pairs;
+}
 
-    // Gather non-empty entries
-    OutPair *pairs = (OutPair*)malloc((g_used ? g_used : 1) * sizeof(OutPair));
+static char *make_test_json_path(const char *path) {
+    if (!path || !path[0]) return NULL;
+    const char *last_sep = strrchr(path, '/');
+    size_t dir_len = last_sep ? (size_t)(last_sep - path + 1) : 0;
+    const char *name = last_sep ? last_sep + 1 : path;
+    const char *prefix = "test-";
+    size_t len = dir_len + strlen(prefix) + strlen(name) + 1;
+    char *out = (char*)malloc(len);
+    if (!out) return NULL;
+    if (dir_len) memcpy(out, path, dir_len);
+    size_t pos = dir_len;
+    memcpy(out + pos, prefix, strlen(prefix));
+    pos += strlen(prefix);
+    memcpy(out + pos, name, strlen(name) + 1);
+    return out;
+}
+
+static int write_profiler_json_from_pairs(const char *path, const OutPair *pairs, size_t npairs, LineTable *lt) {
+    if (!path) return 0;
+    FILE *fj = fopen(path, "wb");
+    if (!fj) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "Profiler dump failed: cannot open %s", path);
+        geo_notify(msg, 240);
+        return -1;
+    }
+    bool wrote = false;
+    fputc('[', fj);
+    size_t lnrows = lt ? lt->nrows : 0;
+    LineRow *lrows = lt ? lt->rows : NULL;
+    if (lnrows > 0 && pairs && npairs > 0) {
+        typedef struct { uint32_t file_idx; uint32_t line; uint64_t cycles; uint64_t samples; uint32_t best_addr; uint64_t best_addr_cycles; } LRec;
+        LRec *jrecs = NULL;
+        size_t jn = 0, jc = 0;
+        for (size_t i = 0; i < npairs; ++i) {
+            const LineRow *r = geo_line_find_row_addr(lrows, lnrows, pairs[i].addr);
+            if (!r) continue;
+            uint32_t fidx = r->file;
+            uint32_t lno = r->line;
+            size_t k = 0;
+            for (; k < jn; ++k) {
+                if (jrecs[k].file_idx == fidx && jrecs[k].line == lno) break;
+            }
+            if (k == jn) {
+                if (jn == jc) {
+                    size_t nc = jc ? jc * 2 : 64;
+                    LRec *nt = (LRec*)realloc(jrecs, nc * sizeof(LRec));
+                    if (!nt) break;
+                    jrecs = nt;
+                    jc = nc;
+                }
+                if (jn < jc) {
+                    jrecs[jn].file_idx = fidx;
+                    jrecs[jn].line = lno;
+                    jrecs[jn].cycles = 0;
+                    jrecs[jn].samples = 0;
+                    jrecs[jn].best_addr = 0;
+                    jrecs[jn].best_addr_cycles = 0;
+                    k = jn++;
+                }
+            }
+            if (k < jn) {
+                jrecs[k].cycles += pairs[i].cycles;
+                jrecs[k].samples += pairs[i].samples;
+                if (pairs[i].cycles > jrecs[k].best_addr_cycles) {
+                    jrecs[k].best_addr = pairs[i].addr;
+                    jrecs[k].best_addr_cycles = pairs[i].cycles;
+                }
+            }
+        }
+        for (size_t i = 0; i < jn; ++i) {
+            const char *fname = (jrecs[i].file_idx > 0 && lt && jrecs[i].file_idx <= lt->nfiles) ? lt->files[jrecs[i].file_idx - 1] : "?";
+            char srcbuf[512] = {0};
+            if (fname && fname[0]) {
+                const char *dir = NULL;
+                if (lt && lt->file_dir && jrecs[i].file_idx > 0 && jrecs[i].file_idx <= lt->nfiles) {
+                    uint32_t di = lt->file_dir[jrecs[i].file_idx - 1];
+                    if (di > 0 && lt->dirs && di <= lt->ndirs) dir = lt->dirs[di - 1];
+                }
+
+                char elf_dir[1024] = {0};
+                char elf_parent[1024] = {0};
+                if (k_prof_elf_path && k_prof_elf_path[0]) {
+                    strncpy(elf_dir, k_prof_elf_path, sizeof(elf_dir) - 1);
+                    char *slash = strrchr(elf_dir, '/');
+                    if (slash) *slash = '\0';
+                    strncpy(elf_parent, elf_dir, sizeof(elf_parent) - 1);
+                    slash = strrchr(elf_parent, '/');
+                    if (slash) *slash = '\0';
+                }
+
+                char fullpath[1024] = {0};
+                const char *c1 = NULL, *c2 = NULL, *c3 = NULL, *c4 = NULL;
+                char buf1[1024] = {0}, buf2[1024] = {0}, buf3[1024] = {0};
+                if (dir && dir[0] == '/') {
+                    snprintf(buf1, sizeof(buf1), "%s/%s", dir, fname);
+                    c1 = buf1;
+                } else if (dir && dir[0]) {
+                    snprintf(buf1, sizeof(buf1), "%s/%s/%s", elf_parent, dir, fname); c1 = buf1;
+                    snprintf(buf2, sizeof(buf2), "%s/%s/%s", elf_dir, dir, fname); c2 = buf2;
+                }
+                snprintf(buf3, sizeof(buf3), "%s/%s", elf_parent, fname); c3 = buf3;
+                c4 = fname;
+
+                const char *cands[4] = { c1, c2, c3, c4 };
+                FILE *sf = NULL;
+                for (size_t ci = 0; ci < 4 && !sf; ++ci) {
+                    if (!cands[ci] || !cands[ci][0]) continue;
+                    snprintf(fullpath, sizeof(fullpath), "%s", cands[ci]);
+                    sf = fopen(fullpath, "rb");
+                }
+
+                if (sf) {
+                    unsigned cur = 1;
+                    while (fgets(srcbuf, sizeof(srcbuf), sf)) {
+                        if (cur == jrecs[i].line) break;
+                        cur++;
+                    }
+                    fclose(sf);
+                    size_t sl = strlen(srcbuf);
+                    while (sl && (srcbuf[sl - 1] == '\n' || srcbuf[sl - 1] == '\r')) srcbuf[--sl] = '\0';
+                }
+            }
+
+            if (i) fputc(',', fj);
+            fputc('{', fj);
+            fputs("\"file\":", fj); json_write_escaped(fj, fname);
+            fprintf(fj, ",\"line\":%u", (unsigned)jrecs[i].line);
+            fprintf(fj, ",\"cycles\":%llu", (unsigned long long)jrecs[i].cycles);
+            fprintf(fj, ",\"count\":%llu", (unsigned long long)jrecs[i].samples);
+            fprintf(fj, ",\"address\":\"0x%06x\"", (unsigned)jrecs[i].best_addr);
+            fputs(",\"source\":", fj); json_write_escaped(fj, srcbuf);
+            fputc('}', fj);
+            wrote = true;
+        }
+        free(jrecs);
+    }
+    if (!wrote && pairs && npairs > 0) {
+        for (size_t i = 0; i < npairs; ++i) {
+            if (i || wrote) fputc(',', fj);
+            fprintf(fj, "{\"pc\":\"0x%06x\",\"samples\":%llu,\"cycles\":%llu}",
+                    (unsigned)(pairs[i].addr & 0x00ffffffu),
+                    (unsigned long long)pairs[i].samples,
+                    (unsigned long long)pairs[i].cycles);
+            wrote = true;
+        }
+    }
+    fputc(']', fj);
+    fclose(fj);
+    return 1;
+}
+
+int geo_profiler_dump(void) {
+    if (!g_ever_enabled)
+        return 0;
+    if (!g_table)
+        return 0;
+
+    size_t npairs = 0;
+    OutPair *pairs = collect_pairs_from_table(g_table, g_used, &npairs);
     if (!pairs)
         goto cleanup;
 
-    size_t npairs = 0;
-    for (size_t i = 0; i < PROF_TABLE_SIZE; ++i) {
-        if (g_table[i].key != 0 && (g_table[i].samples != 0 || g_table[i].cycles != 0)) {
-            pairs[npairs].addr = g_table[i].key - 1u;
-            pairs[npairs].samples = g_table[i].samples;
-            pairs[npairs].cycles = g_table[i].cycles;
-            ++npairs;
-        }
-    }
-
-    // Sort by samples descending for PC list (stable/simple sort)
-    qsort(pairs, npairs, sizeof(OutPair), cmp_desc_count);
-
-    // Function-level aggregation removed (line-level aggregation + JSON only)
-
-    // By-line aggregation (DWARF .debug_line)
     build_global_line_table();
-    LineTable lt = (LineTable){0};
-    LineRow *lrows = NULL; size_t lnrows = 0;
-    if (k_prof_elf_path && k_prof_elf_path[0] && geo_elf_load_line_table(k_prof_elf_path, &lt)) {
-        lrows = lt.rows; lnrows = lt.nrows;
+    LineTable lt = {0};
+    if (k_prof_elf_path && k_prof_elf_path[0]) {
+        geo_elf_load_line_table(k_prof_elf_path, &lt);
     }
 
-    if (lnrows > 0) {
-        // Aggregate by file index + line and track a representative address
-        typedef struct { uint32_t file_idx; uint32_t line; uint64_t cycles; uint64_t samples; uint32_t best_addr; uint64_t best_addr_cycles; } LRec;
-        LRec *lrecs = NULL; size_t nl=0, cl=0;
-        for (size_t i=0;i<npairs;++i) {
-            const LineRow *r = geo_line_find_row_addr(lrows, lnrows, pairs[i].addr);
-            if (!r) continue;
-            uint32_t fidx = r->file; uint32_t lno = r->line;
-            size_t k=0; for (; k<nl; ++k) if (lrecs[k].file_idx==fidx && lrecs[k].line==lno) break;
-            if (k==nl){ if (nl==cl){ size_t nc=cl?cl*2:64; LRec* nt=(LRec*)realloc(lrecs, nc*sizeof(*nt)); if(!nt) break; lrecs=nt; cl=nc; } lrecs[nl].file_idx=fidx; lrecs[nl].line=lno; lrecs[nl].cycles=0; lrecs[nl].samples=0; lrecs[nl].best_addr=0; lrecs[nl].best_addr_cycles=0; k=nl++; }
-            lrecs[k].cycles += pairs[i].cycles;
-            lrecs[k].samples += pairs[i].samples;
-            if (pairs[i].cycles > lrecs[k].best_addr_cycles) { lrecs[k].best_addr = pairs[i].addr; lrecs[k].best_addr_cycles = pairs[i].cycles; }
-        }
-        // Convert to printable list with file names
-        LAgg *lags = NULL; size_t nlag=0, clag=0;
-        for (size_t i=0;i<nl;++i) {
-            const char *fname = (lrecs[i].file_idx>0 && lrecs[i].file_idx<=lt.nfiles) ? lt.files[lrecs[i].file_idx-1] : "?";
-            char keybuf[512]; snprintf(keybuf, sizeof(keybuf), "%s:%u", fname, (unsigned)lrecs[i].line);
-            if (nlag==clag){ size_t nc=clag?clag*2:64; LAgg* nt=(LAgg*)realloc(lags, nc*sizeof(*nt)); if(!nt) break; lags=nt; clag=nc; }
-            size_t l=strlen(keybuf)+1; lags[nlag].key=(char*)malloc(l); if(!lags[nlag].key) break; memcpy(lags[nlag].key,keybuf,l); lags[nlag].cycles=lrecs[i].cycles; nlag++;
-        }
-        // Sort desc
-        qsort(lags, nlag, sizeof(LAgg), cmp_lagg_desc);
+    const char *json_path = (k_prof_json_path && k_prof_json_path[0]) ? k_prof_json_path :
+                            (k_prof_out_path && k_prof_out_path[0]) ? k_prof_out_path : NULL;
+    int rc = 0;
+    if (json_path) {
+        int wrote = write_profiler_json_from_pairs(json_path, pairs, npairs, &lt);
+        if (wrote < 0)
+            rc = -1;
+        else if (wrote > 0 && rc <= 0)
+            rc = 1;
 
-        for (size_t i=0;i<nlag;++i) free(lags[i].key);
-        free(lags);
-        free(lrecs);
-
-        // Also emit a JSON file with consolidated entries
-        {
-            const char *json_path = k_prof_json_path;
-            FILE *fj = (json_path && json_path[0]) ? fopen(json_path, "wb") : NULL;
-            if (fj) {
-
-                // Rebuild lrecs for JSON since we freed it above
-                LRec *jrecs = NULL; size_t jn=0, jc=0;
-                for (size_t i=0;i<npairs;++i) {
-                    const LineRow *r = geo_line_find_row_addr(lrows, lnrows, pairs[i].addr);
-                    if (!r) continue;
-                    uint32_t fidx = r->file; uint32_t lno = r->line;
-                    size_t k=0; for (; k<jn; ++k) if (jrecs[k].file_idx==fidx && jrecs[k].line==lno) break;
-                    if (k==jn){ if (jn==jc){ size_t nc=jc?jc*2:64; LRec* nt=(LRec*)realloc(jrecs, nc*sizeof(*nt)); if(!nt) break; jrecs=nt; jc=nc; } jrecs[jn].file_idx=fidx; jrecs[jn].line=lno; jrecs[jn].cycles=0; jrecs[jn].samples=0; jrecs[jn].best_addr=0; jrecs[jn].best_addr_cycles=0; k=jn++; }
-                    jrecs[k].cycles += pairs[i].cycles;
-                    jrecs[k].samples += pairs[i].samples;
-                    if (pairs[i].cycles > jrecs[k].best_addr_cycles) { jrecs[k].best_addr = pairs[i].addr; jrecs[k].best_addr_cycles = pairs[i].cycles; }
+        #ifdef GEO_PROF_STREAM_VERIFY
+        if (g_stream_capture_used > 0) {
+            char *test_path = make_test_json_path(json_path);
+            if (test_path) {
+                size_t test_npairs = 0;
+                OutPair *test_pairs = collect_pairs_from_table(g_stream_capture, g_stream_capture_used, &test_npairs);
+                if (test_pairs) {
+                    write_profiler_json_from_pairs(test_path, test_pairs, test_npairs, &lt);
+                    free(test_pairs);
                 }
-
-                fputc('[', fj);
-                for (size_t i=0; i<jn; ++i) {
-                    const char *fname = (jrecs[i].file_idx>0 && jrecs[i].file_idx<=lt.nfiles) ? lt.files[jrecs[i].file_idx-1] : "?";
-                    // source text (best-effort): try to resolve via DWARF dirs
-                    char srcbuf[512] = {0};
-                    if (fname && fname[0]) {
-                        const char *dir = NULL;
-                        if (lt.file_dir && jrecs[i].file_idx>0 && jrecs[i].file_idx<=lt.nfiles) {
-                            uint32_t di = lt.file_dir[jrecs[i].file_idx - 1];
-                            if (di > 0 && lt.dirs && di <= lt.ndirs) dir = lt.dirs[di - 1];
-                        }
-
-                        // Derive ELF directory and its parent as fallbacks
-                        char elf_dir[1024] = {0};
-                        char elf_parent[1024] = {0};
-                        {
-                            strncpy(elf_dir, k_prof_elf_path, sizeof(elf_dir)-1);
-                            char *slash = strrchr(elf_dir, '/');
-                            if (slash) { *slash = '\0'; }
-                            strncpy(elf_parent, elf_dir, sizeof(elf_parent)-1);
-                            slash = strrchr(elf_parent, '/');
-                            if (slash) { *slash = '\0'; }
-                        }
-
-                        // Try a few candidate paths
-                        char fullpath[1024] = {0};
-                        const char *c1 = NULL, *c2 = NULL, *c3 = NULL, *c4 = NULL;
-                        char buf1[1024] = {0}, buf2[1024] = {0}, buf3[1024] = {0};
-                        if (dir && dir[0] == '/') {
-                            // absolute dir from DWARF
-                            snprintf(buf1, sizeof(buf1), "%s/%s", dir, fname); c1 = buf1;
-                        } else if (dir && dir[0]) {
-                            // relative dir: try parent of ELF dir, then ELF dir
-                            snprintf(buf1, sizeof(buf1), "%s/%s/%s", elf_parent, dir, fname); c1 = buf1;
-                            snprintf(buf2, sizeof(buf2), "%s/%s/%s", elf_dir, dir, fname); c2 = buf2;
-                        }
-                        // Also try file relative to ELF parent and as-is
-                        snprintf(buf3, sizeof(buf3), "%s/%s", elf_parent, fname); c3 = buf3;
-                        c4 = fname;
-
-                        const char *cands[4] = { c1, c2, c3, c4 };
-                        FILE *sf = NULL;
-                        for (size_t ci=0; ci<4 && !sf; ++ci) {
-                            if (!cands[ci] || !cands[ci][0]) continue;
-                            snprintf(fullpath, sizeof(fullpath), "%s", cands[ci]);
-                            sf = fopen(fullpath, "rb");
-                        }
-                        if (sf) {
-                            unsigned cur=1; while (fgets(srcbuf, sizeof(srcbuf), sf)) { if (cur==jrecs[i].line) break; cur++; }
-                            fclose(sf);
-                            size_t sl = strlen(srcbuf); while (sl && (srcbuf[sl-1]=='\n' || srcbuf[sl-1]=='\r')) srcbuf[--sl] = '\0';
-                        }
-                    }
-
-                    if (i) fputc(',', fj);
-                    fputc('{', fj);
-                    fputs("\"file\":", fj); json_write_escaped(fj, fname);
-                    fprintf(fj, ",\"line\":%u", (unsigned)jrecs[i].line);
-                    fprintf(fj, ",\"cycles\":%llu", (unsigned long long)jrecs[i].cycles);
-                    fprintf(fj, ",\"count\":%llu", (unsigned long long)jrecs[i].samples);
-                    fprintf(fj, ",\"address\":\"0x%06x\"", (unsigned)jrecs[i].best_addr);
-                    fputs(",\"source\":", fj); json_write_escaped(fj, srcbuf);
-                    fputc('}', fj);
-                }
-                fputc(']', fj);
-                fclose(fj);
-                if (jrecs) free(jrecs);
+                free(test_path);
             }
         }
+        #endif
     }
-    geo_elf_free_line_table(&lt);
 
-    // Cleanup
-    // No function/inline resources to free
+    geo_elf_free_line_table(&lt);
     free(pairs);
 
 cleanup:
@@ -1335,6 +1560,14 @@ cleanup:
     g_used = 0;
     g_sample_accum = 0;
     g_enabled = 0;
+    stream_capture_free();
+    return rc;
+}
+
+const char *geo_profiler_dump_path(void) {
+    if (k_prof_json_path && k_prof_json_path[0]) return k_prof_json_path;
+    if (k_prof_out_path && k_prof_out_path[0]) return k_prof_out_path;
+    return NULL;
 }
 // ------------------ DWARF .debug_line (v2-v4) minimal parser ------------------
 

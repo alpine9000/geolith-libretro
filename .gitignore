@@ -4,3 +4,4 @@
 *.dylib
 geolith_libretro.*
 objs/
+tools

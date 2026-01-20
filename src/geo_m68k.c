@@ -30,6 +30,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "m68k/m68k.h"
 #include "m68k/m68kcpu.h"
@@ -40,8 +41,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "geo_rtc.h"
 #include "geo_serial.h"
 #include "geo_z80.h"
+#include "geo_ipc.h"
 
 #define SMATAP 0x98ec // NEO-SMA Tapped bits - 2, 3, 5, 6, 7, 11, 12, and 15
+#define GEO_DBG_TEXT_ADDR 0xFFFF0 // Fake debug output register
 
 // Game ROM data
 static romdata_t *romdata = NULL;
@@ -118,6 +121,12 @@ static inline uint16_t read16(uint8_t *ptr, uint32_t addr) {
 
 static inline uint16_t read16be(uint8_t *ptr, uint32_t addr) {
     return (ptr[addr + 1] << 8) | ptr[addr];
+}
+
+static inline void geo_debug_print_byte(uint8_t byte) {
+    putchar((char)byte);
+    fflush(stdout);
+    geo_ipc_send_debug_byte(byte);
 }
 
 static inline void write08(uint8_t *ptr, uint32_t addr, uint8_t data) {
@@ -975,6 +984,10 @@ void m68k_write_memory_8(unsigned address, unsigned value) {
     if (address < 0x100000) { // Fixed 1M Program ROM Bank
         geo_log(GEO_LOG_DBG, "68K write to Program ROM: %06x %02x\n",
             address, value);
+	if (address ==  GEO_DBG_TEXT_ADDR) {
+	  geo_debug_print_byte((uint8_t)value);
+	  return;
+	}	
     }
     else if (address < 0x200000) { // RAM - Mirrored every 64K
         m68k_modify_timeslice(1);
@@ -1107,7 +1120,7 @@ void m68k_write_memory_8(unsigned address, unsigned value) {
                 reg_sramlock = 0;
                 return;
             }
-            case 0x3a001f: { // REG_PALBANK0
+           case 0x3a001f: { // REG_PALBANK0
                 geo_lspc_palram_bank(0);
                 return;
             }
@@ -1119,6 +1132,7 @@ void m68k_write_memory_8(unsigned address, unsigned value) {
                 m68k_write_memory_16(address, (value << 8) | (value & 0xff));
                 return;
             }
+
         }
         geo_log(GEO_LOG_DBG, "Unknown 8-bit Write: %06x, %02x\n",
             address, value);

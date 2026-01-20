@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <pthread.h>
 
 #include "m68k/m68k.h"
 
@@ -31,6 +32,12 @@ static uint32_t s_hit_pc = 0;
 #define GEO_DBG_BP_MAX 64
 static uint32_t s_bps[GEO_DBG_BP_MAX];
 static size_t s_nbps = 0;
+static pthread_mutex_t s_bp_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void log_bp_event(const char *verb, uint32_t pc24) {
+    printf("Debugger: %s 0x%06x\n", verb, (unsigned)(pc24 & 0x00ffffffu));
+    fflush(stdout);
+}
 
 // Line table for source mapping (optional)
 static LineTable s_line_table = {0};
@@ -88,36 +95,63 @@ void geo_debugger_step_instr(void) {
 int  geo_debugger_break_now(void) { int r = s_break_now; s_break_now = 0; return r; }
 int  geo_debugger_consume_resnap_needed(void) { int r = s_resnap_needed; s_resnap_needed = 0; return r; }
 
+static int has_breakpoint_locked(uint32_t pc24) {
+    for (size_t i = 0; i < s_nbps; ++i) {
+        if (s_bps[i] == pc24) return 1;
+    }
+    return 0;
+}
+
 static int has_breakpoint(uint32_t pc24) {
-    for (size_t i=0;i<s_nbps;i++) if (s_bps[i] == pc24) return 1; return 0;
+    int result;
+    pthread_mutex_lock(&s_bp_mutex);
+    result = has_breakpoint_locked(pc24);
+    pthread_mutex_unlock(&s_bp_mutex);
+    return result;
 }
 
 static void toggle_breakpoint(uint32_t pc24) {
+    pc24 &= 0x00ffffffu;
+    pthread_mutex_lock(&s_bp_mutex);
     for (size_t i=0;i<s_nbps;i++) {
         if (s_bps[i] == pc24) {
             // remove by swap-with-last
             s_bps[i] = s_bps[s_nbps-1];
             s_nbps--;
+            pthread_mutex_unlock(&s_bp_mutex);
             return;
         }
     }
-    if (s_nbps < GEO_DBG_BP_MAX) s_bps[s_nbps++] = pc24;
+    if (s_nbps < GEO_DBG_BP_MAX) {
+        s_bps[s_nbps++] = pc24;
+        log_bp_event("Breakpoint set", pc24);
+    }
+    pthread_mutex_unlock(&s_bp_mutex);
 }
 
 void geo_debugger_add_breakpoint(uint32_t pc24) {
-    if (has_breakpoint(pc24)) return;
-    if (s_nbps < GEO_DBG_BP_MAX) s_bps[s_nbps++] = (pc24 & 0x00ffffffu);
+    pc24 &= 0x00ffffffu;
+    pthread_mutex_lock(&s_bp_mutex);
+    if (!has_breakpoint_locked(pc24) && s_nbps < GEO_DBG_BP_MAX) {
+        s_bps[s_nbps++] = pc24;
+        log_bp_event("Breakpoint set", pc24);
+    }
+    pthread_mutex_unlock(&s_bp_mutex);
 }
 
 void geo_debugger_remove_breakpoint(uint32_t pc24) {
     pc24 &= 0x00ffffffu;
+    pthread_mutex_lock(&s_bp_mutex);
     for (size_t i=0;i<s_nbps;i++) {
         if (s_bps[i] == pc24) {
             s_bps[i] = s_bps[s_nbps-1];
             s_nbps--;
+            log_bp_event("Breakpoint cleared", pc24);
+            pthread_mutex_unlock(&s_bp_mutex);
             return;
         }
     }
+    pthread_mutex_unlock(&s_bp_mutex);
 }
 
 int geo_debugger_has_breakpoint(uint32_t pc24) { return has_breakpoint(pc24 & 0x00ffffffu); }
@@ -274,6 +308,24 @@ void geo_debugger_ui_update(int key_enable, int key_toggle, int key_continue,
         if (notify) notify(has_breakpoint(pc24)?"Breakpoint set":"Breakpoint cleared", 90);
     }
     prev_bp = now;
+}
+
+void geo_debugger_list_breakpoints(void (*notify)(const char *msg, int frames)) {
+    pthread_mutex_lock(&s_bp_mutex);
+    if (s_nbps == 0) {
+        printf("Debugger: no breakpoints\n");
+        fflush(stdout);
+        pthread_mutex_unlock(&s_bp_mutex);
+        if (notify) notify("Breakpoints: none", 120);
+        return;
+    }
+    printf("Debugger: breakpoints (%zu)\n", s_nbps);
+    for (size_t i = 0; i < s_nbps; ++i) {
+        printf("  0x%06x\n", (unsigned)s_bps[i]);
+    }
+    fflush(stdout);
+    pthread_mutex_unlock(&s_bp_mutex);
+    if (notify) notify("Breakpoints logged to console", 120);
 }
 
 // Minimal overlay just shows paused state, PC and file:line

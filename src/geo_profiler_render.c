@@ -36,6 +36,7 @@ void geo_profiler_ui_update(int key_f10, int key_comma, int key_period,
             if (!e_elf || !*e_elf || !e_json || !*e_json) {
                 if (notify) notify("Set GEO_PROF_ELF and GEO_PROF_JSON env vars", 240);
             } else {
+                geo_profiler_init();
                 geo_profiler_reset();
                 geo_profiler_set_enabled(1);
                 s_scroll = 0;
@@ -43,6 +44,7 @@ void geo_profiler_ui_update(int key_f10, int key_comma, int key_period,
             }
         } else {
             geo_profiler_set_enabled(0);
+            geo_profiler_dump();
             if (notify) notify("Profiler OFF", 120);
         }
     }

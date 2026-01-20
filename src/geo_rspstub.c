@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #ifndef GEO_RSP_LOG
-#define GEO_RSP_LOG 1
+#define GEO_RSP_LOG 0
 #endif
 
 static int s_lfd=-1, s_cfd=-1;
@@ -151,14 +151,59 @@ static void handle_cmd(const char *pkt){
   if(pkt[0]=='c'){ if(pkt[1]){ uint32_t a=0; sscanf(pkt+1, "%x", &a); if(s_ops.write_reg) s_ops.write_reg(17,a); } if(s_ops.resume_continue) s_ops.resume_continue(); s_running=1; return; }
   if(pkt[0]=='s'){ if(pkt[1]){ uint32_t a=0; sscanf(pkt+1, "%x", &a); if(s_ops.write_reg) s_ops.write_reg(17,a); } if(s_ops.resume_step) s_ops.resume_step(); s_running=1; return; }
 
-  if(ci_starts(pkt,"Z0,")){ uint32_t a=0; unsigned k=0; sscanf(pkt+3, "%x,%u", &a, &k); if(s_ops.add_sw_break) s_ops.add_sw_break(a); send_packet("OK"); return; }
-  if(ci_starts(pkt,"z0,")){ uint32_t a=0; unsigned k=0; sscanf(pkt+3, "%x,%u", &a, &k); if(s_ops.del_sw_break) s_ops.del_sw_break(a); send_packet("OK"); return; }
+  if(pkt[0]=='z' && ci_starts(pkt,"z0,")){ uint32_t a=0; unsigned k=0; sscanf(pkt+3, "%x,%u", &a, &k); if(s_ops.del_sw_break) s_ops.del_sw_break(a); send_packet("OK"); return; }
+  if(pkt[0]=='Z' && ci_starts(pkt,"Z0,")){ uint32_t a=0; unsigned k=0; sscanf(pkt+3, "%x,%u", &a, &k); if(s_ops.add_sw_break) s_ops.add_sw_break(a); send_packet("OK"); return; }
 
   // Default empty reply
   send_packet("");
 }
 
-static void* thr(void*arg){ (void)arg; s_run=1; for(;;){ if(!s_run) break; if(s_cfd<0){ struct sockaddr_in c; socklen_t cl=sizeof(c); int cfd=accept(s_lfd,(struct sockaddr*)&c,&cl); if(cfd>=0){ int one=1; setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); s_cfd=cfd; s_noack=0; logline("* ", "client connected"); } else { usleep(2000);} continue; } char pkt[4096]; int n=read_packet(pkt,sizeof(pkt)); if(n<0){ if(s_cfd>=0){ close(s_cfd); s_cfd=-1; logline("* ", "client disconnected"); } continue; } handle_cmd(pkt);} if(s_cfd>=0){ close(s_cfd); s_cfd=-1; } return NULL; }
+static void* thr(void*arg) {
+  (void)arg;
+  s_run = 1;
+  for (;;) {
+    if (!s_run) break;
+    if (s_cfd < 0) {
+      struct sockaddr_in c;
+      socklen_t cl = sizeof(c);
+      int cfd = accept(s_lfd, (struct sockaddr*)&c, &cl);
+      if (cfd >= 0) {
+        int one = 1;
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        s_cfd = cfd;
+        s_noack = 0;
+        logline("* ", "client connected");
+        s_running = 0;
+        if (s_ops.request_break) s_ops.request_break();
+        send_packet("S05");
+      } else {
+        usleep(2000);
+      }
+      continue;
+    }
+    char pkt[4096];
+    int n = read_packet(pkt, sizeof(pkt));
+    if (n < 0) {
+      if (s_cfd >= 0) {
+        close(s_cfd);
+        s_cfd = -1;
+        logline("* ", "client disconnected");
+        // Keep the core running when the debugger disconnects.
+        if (s_ops.resume_continue) {
+          s_ops.resume_continue();
+        }
+        s_running = 0;
+      }
+      continue;
+    }
+    handle_cmd(pkt);
+  }
+  if (s_cfd >= 0) {
+    close(s_cfd);
+    s_cfd = -1;
+  }
+  return NULL;
+}
 
 int geo_rspstub_start(int port, const geo_rspstub_ops_t *ops){
   if(s_run) return port;
@@ -184,4 +229,3 @@ void geo_rspstub_stop(void){
 }
 
 void geo_rspstub_poll(int paused){ if(s_cfd>=0 && paused && s_running){ send_packet("S05"); s_running=0; } }
-

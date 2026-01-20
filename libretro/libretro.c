@@ -45,6 +45,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "geo_text.h"
 #include "geo_debugger.h"
 #include "geo_ui.h"
+#include "geo_notify.h"
 #include "geo_ports.h"
 #include "geo_debugger.h"
 #include "geo_rsp.h"
@@ -1068,6 +1069,7 @@ static void front_kb_cb(bool down, unsigned keycode, uint32_t character, uint16_
 
 void retro_set_environment(retro_environment_t cb) {
     environ_cb = cb;
+    geo_notify_register(prof_notify_cb);
     libretro_set_core_options(environ_cb);
     // Register keyboard callback for reliable key events
     struct retro_keyboard_callback kcb; memset(&kcb, 0, sizeof(kcb));
@@ -1118,6 +1120,9 @@ void retro_run(void) {
     }
 
     // (input handled earlier this frame)
+
+    // Apply any pending IPC commands
+    geo_ipc_apply_pending();
 
     // Service RSP stop replies
     {
@@ -1324,9 +1329,7 @@ void retro_unload_game(void) {
             log_cb(RETRO_LOG_DEBUG, "Save Failed: %s\n", savename);
     }
 
-    // Dump profiler results before freeing resources
-    geo_profiler_dump();
-
+    // Profiler dumps now run via the F10 toggle, so no action needed here.
     if (romdata)
         free(romdata);
 

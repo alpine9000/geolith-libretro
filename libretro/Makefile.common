@@ -34,6 +34,7 @@ SOURCES_C := \
 	$(CORE_DIR)/src/geo_profiler.c \
 	$(CORE_DIR)/src/geo_profiler_elf.c \
 	$(CORE_DIR)/src/geo_profiler_render.c \
+	$(CORE_DIR)/src/geo_notify.c \
 	$(CORE_DIR)/src/geo_ipc.c \
 	$(CORE_DIR)/src/geo_rsp.c \
 	$(CORE_DIR)/src/geo_ui.c \
